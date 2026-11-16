@@ -45,9 +45,10 @@ int main(int argc, char** argv) {
         double fator_area = (static_cast<double>(largura) * altura) / (1280.0 * 720.0);
 
         // Aplicação do Filtro Gaussiano via CImg
-        // Sigma = 2.0 é ideal para suavizar a textura áspera da bancada metálica
-        // sem destruir as bordas estruturais dos parafusos e porcas.
-        CImg<unsigned char> img_blur = img_gray.get_blur(2.0f);
+        // Sigma proporcional à escala da imagem (~3.0 em 4K) para suavizar a textura
+        // áspera da bancada metálica ou tramas de tecido sem destruir as bordas das peças.
+        float sigma = static_cast<float>(0.95 * fator_escala);
+        CImg<unsigned char> img_blur = img_gray.get_blur(sigma);
         img_blur.save("etapa1_b_gaussiano.jpg");
 
 
@@ -80,8 +81,8 @@ int main(int argc, char** argv) {
         // 2.2 Detector de Bordas de Canny
         // O Canny captura tanto peças mais claras quanto mais escuras que o fundo
         cv::Mat mat_bordas;
-        double limiar_inferior = 35.0;
-        double limiar_superior = 100.0;
+        double limiar_inferior = 25.0;
+        double limiar_superior = 75.0;
         cv::Canny(mat_blur, mat_bordas, limiar_inferior, limiar_superior);
         cv::imwrite("etapa2_b_bordas_canny.jpg", mat_bordas);
 
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
         // Remove pequenos fragmentos isolados de ruído/reflexo da bancada antes do fechamento
         cv::Mat labels, stats, centroids;
         int num_labels = cv::connectedComponentsWithStats(mat_morfologia, labels, stats, centroids, 8, CV_32S);
-        int min_pixels_borda = static_cast<int>(45 * fator_area);
+        int min_pixels_borda = static_cast<int>(65 * fator_area);
         for (int lbl = 1; lbl < num_labels; lbl++) {
             if (stats.at<int>(lbl, cv::CC_STAT_AREA) < min_pixels_borda) {
                 mat_morfologia.setTo(0, labels == lbl);
@@ -117,10 +118,12 @@ int main(int argc, char** argv) {
         cv::morphologyEx(mat_morfologia, mat_morfologia, cv::MORPH_CLOSE, kernel, cv::Point(-1, -1), 2);
 
         // Preenche o interior dos contornos fechados para formar sólidos reais antes da abertura
+        // (limitado a contornos menores que AREA_MAXIMA para evitar inundar frestas ou manchas grandes do fundo)
         std::vector<std::vector<cv::Point>> contornos_temp;
         cv::findContours(mat_morfologia, contornos_temp, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
         for (size_t i = 0; i < contornos_temp.size(); i++) {
-            if (cv::contourArea(contornos_temp[i]) > 300.0 * fator_area) {
+            double area_temp = cv::contourArea(contornos_temp[i]);
+            if (area_temp > 300.0 * fator_area && area_temp < 85000.0 * fator_area) {
                 cv::drawContours(mat_morfologia, contornos_temp, static_cast<int>(i), cv::Scalar(255), cv::FILLED);
             }
         }
@@ -148,9 +151,9 @@ int main(int argc, char** argv) {
         cv::Mat mat_resultado = mat_original.clone();
         int contador_pecas = 0;
 
-        // Área mínima em pixels proporcional à resolução da imagem para filtrar sujeiras ou riscos na bancada
-        // (Para ~720x1280, ~600 px² é um ótimo corte; em 4K escala proporcionalmente)
-        const double AREA_MINIMA = 650.0 * std::max(1.0, fator_area); 
+        // Limites de área proporcional à resolução da imagem para filtrar sujeiras ou manchas grandes da bancada
+        const double AREA_MINIMA = 950.0 * std::max(1.0, fator_area);
+        const double AREA_MAXIMA = 85000.0 * std::max(1.0, fator_area);
         int espessura_linha = std::max(2, static_cast<int>(std::round(2.0 * fator_escala)));
         int raio_vertice = std::max(3, static_cast<int>(std::round(3.5 * fator_escala)));
         double escala_fonte = 0.55 * fator_escala;
@@ -158,8 +161,17 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < contornos.size(); i++) {
             double area = cv::contourArea(contornos[i]);
             
-            if (area < AREA_MINIMA) {
-                continue; // Ignora ruídos da bancada
+            if (area < AREA_MINIMA || area > AREA_MAXIMA) {
+                continue; // Ignora ruídos pequenos ou manchas gigantes da bancada
+            }
+
+            // Filtra pequenos riscos ramificados e reflexos irregulares da bancada através da solidez
+            std::vector<cv::Point> fecho_convexo;
+            cv::convexHull(contornos[i], fecho_convexo);
+            double area_fecho = cv::contourArea(fecho_convexo);
+            double solidez = (area_fecho > 0.0) ? (area / area_fecho) : 0.0;
+            if (area < 2500.0 * fator_area && solidez < 0.42) {
+                continue;
             }
 
             contador_pecas++;
